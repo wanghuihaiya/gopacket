@@ -391,6 +391,78 @@ func (w *NgWriter) WritePacket(ci gopacket.CaptureInfo, data []byte) error {
 	return err
 }
 
+
+func (w *NgWriter) WritePacketWithOptionalComment(ci gopacket.CaptureInfo, data []byte, comment string) error {
+	if ci.InterfaceIndex >= int(w.intf) || ci.InterfaceIndex < 0 {
+		return fmt.Errorf("Can't send statistics for non existent interface %d; have only %d interfaces", ci.InterfaceIndex, w.intf)
+	}
+	if ci.CaptureLength != len(data) {
+		return fmt.Errorf("capture length %d does not match data length %d", ci.CaptureLength, len(data))
+	}
+	if ci.CaptureLength > ci.Length {
+		return fmt.Errorf("invalid capture info %+v:  capture length > length", ci)
+	}
+
+	ts := ci.Timestamp.UnixNano()
+	options := []byte{}
+
+	// 如果 comment 不为空，构造 Option 字段
+	if comment != "" {
+		commentBytes := []byte(comment)
+		optionLen := len(commentBytes)
+		padLen := (4 - (optionLen % 4)) % 4
+
+		// Option Code 1 = Comment
+		tmp := make([]byte, 4+optionLen+padLen)
+		binary.LittleEndian.PutUint16(tmp[0:2], 1)                      // Option Code: 1 (Comment)
+		binary.LittleEndian.PutUint16(tmp[2:4], uint16(optionLen))      // Option Length
+		copy(tmp[4:], commentBytes)
+		// padding is already zero-initialized
+		options = append(options, tmp...)
+
+		// End of Options (Option Code 0, Length 0)
+		options = append(options, []byte{0x00, 0x00, 0x00, 0x00}...)
+	}
+
+	// 计算完整 block 长度（28 header + data + padding + options + 4 trailer）
+	packetLen := uint32(len(data))
+	packetPad := (4 - (packetLen % 4)) % 4
+	blockLen := uint32(28) + packetLen + packetPad + uint32(len(options)) + 4
+
+	buf := make([]byte, 0, blockLen)
+
+	// Block Header
+	tmp := make([]byte, 28)
+	binary.LittleEndian.PutUint32(tmp[0:4], uint32(ngBlockTypeEnhancedPacket))
+	binary.LittleEndian.PutUint32(tmp[4:8], blockLen)
+	binary.LittleEndian.PutUint32(tmp[8:12], uint32(ci.InterfaceIndex))
+	binary.LittleEndian.PutUint32(tmp[12:16], uint32(ts>>32)) // timestamp high
+	binary.LittleEndian.PutUint32(tmp[16:20], uint32(ts))     // timestamp low
+	binary.LittleEndian.PutUint32(tmp[20:24], uint32(ci.CaptureLength))
+	binary.LittleEndian.PutUint32(tmp[24:28], uint32(ci.Length))
+	buf = append(buf, tmp...)
+
+	// Packet Data + Padding
+	buf = append(buf, data...)
+	if packetPad > 0 {
+		buf = append(buf, make([]byte, packetPad)...)
+	}
+
+	// Options
+	if len(options) > 0 {
+		buf = append(buf, options...)
+	}
+
+	// Block Trailer (repeat block total length)
+	tmpTrailer := make([]byte, 4)
+	binary.LittleEndian.PutUint32(tmpTrailer, blockLen)
+	buf = append(buf, tmpTrailer...)
+
+	_, err := w.w.Write(buf)
+	return err
+}
+
+
 // Flush writes out buffered data to the storage media. Must be called before closing the underlying file.
 func (w *NgWriter) Flush() error {
 	return w.w.Flush()
